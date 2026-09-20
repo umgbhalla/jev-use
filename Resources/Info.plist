@@ -12,9 +12,8 @@
     <key>LSMinimumSystemVersion</key><string>14.2</string>
     <key>LSUIElement</key><true/>
     <key>NSHighResolutionCapable</key><true/>
-    <key>NSMicrophoneUsageDescription</key><string>Listen while you hold Control–Option–Space to give a desktop command.</string>
+    <key>NSMicrophoneUsageDescription</key><string>Listen through the Mac’s built-in microphone while you hold Control–Space to give a desktop command.</string>
     <key>NSSpeechRecognitionUsageDescription</key><string>Turn your spoken command into text. Apple may process audio online when on-device recognition is unavailable.</string>
-    <key>NSAudioCaptureUsageDescription</key><string>Show a music visualiser in the widget while audio is playing. Audio is reduced to a few levels on the spot and never recorded or sent anywhere.</string>
     <key>NSDesktopFolderUsageDescription</key><string>Find the names of Desktop folders you ask to open. File contents are not read.</string>
     <key>NSDocumentsFolderUsageDescription</key><string>Identify folders shown in Finder so they can be opened by voice. File contents are not read.</string>
     <key>NSDownloadsFolderUsageDescription</key><string>Identify folders shown in Finder so they can be opened by voice. File contents are not read.</string>

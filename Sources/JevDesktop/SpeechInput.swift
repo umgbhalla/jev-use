@@ -1,12 +1,13 @@
 import AVFoundation
-import Accelerate
 import Combine
+import CoreAudio
 import Foundation
 import Speech
 import os
 
 @MainActor
 final class SpeechInput: ObservableObject {
+    private let log = Logger(subsystem: "local.jev-use", category: "speech")
     @Published var transcript = ""
     @Published var isListening = false
     @Published var status = ""
@@ -14,12 +15,14 @@ final class SpeechInput: ObservableObject {
     var onFinal: ((String) -> Void)?
     var onFailure: ((String) -> Void)?
 
-    private let engine = AVAudioEngine()
     private let recognizer = SFSpeechRecognizer()
+    private let captureQueue = DispatchQueue(label: "local.jev-use.microphone")
     private var request: SFSpeechAudioBufferRecognitionRequest?
     private var task: SFSpeechRecognitionTask?
-    private var audioGate: OSAllocatedUnfairLock<Bool>?
-    private var tapInstalled = false
+    private var captureSession: AVCaptureSession?
+    private var captureOutput: AVCaptureAudioDataOutput?
+    private var sampleSink: SpeechAudioSampleSink?
+    private var routeObservers: [NSObjectProtocol] = []
     private var generation = UUID()
     private var isStarting = false
     private var releaseRequested = false
@@ -62,6 +65,7 @@ final class SpeechInput: ObservableObject {
         cancel()
         let current = generation
         isStarting = true
+        defer { if generation == current { isStarting = false } }
         transcript = ""
         status = "Preparing microphone…"
         let permitted = await requestPermissions()
@@ -69,23 +73,12 @@ final class SpeechInput: ObservableObject {
             if generation == current { cancel() }
             throw CancellationError()
         }
-        isStarting = false
         guard permitted else { throw SpeechInputError(message: status) }
         guard let recognizer, recognizer.isAvailable else {
             status = "Apple speech recognition is currently unavailable."
             throw SpeechInputError(message: status)
         }
-        guard AVCaptureDevice.default(for: .audio) != nil else {
-            status = "No microphone is available. Connect a microphone and try again."
-            throw SpeechInputError(message: status)
-        }
-
-        let input = engine.inputNode
-        let format = input.outputFormat(forBus: 0)
-        guard format.channelCount > 0, format.sampleRate.isFinite, format.sampleRate > 0 else {
-            status = "The microphone has no usable audio format. Check the selected input in System Settings → Sound."
-            throw SpeechInputError(message: status)
-        }
+        let microphone = try Self.builtInMicrophone()
 
         let request = SFSpeechAudioBufferRecognitionRequest()
         request.shouldReportPartialResults = true
@@ -93,26 +86,14 @@ final class SpeechInput: ObservableObject {
         // Keep Apple's default language and choice of local or online processing.
         recognitionMode = "Apple speech (may use the internet)"
         self.request = request
-        let gate = OSAllocatedUnfairLock(initialState: true)
-        audioGate = gate
-        input.installTap(onBus: 0, bufferSize: 1_024, format: format) { [weak self] buffer, _ in
-            gate.withLock { acceptingAudio in
-                if acceptingAudio { request.append(buffer) }
-            }
-            guard let channels = buffer.floatChannelData, buffer.frameLength > 0 else { return }
-            var loudest: Float = 0
-            for channel in 0..<Int(buffer.format.channelCount) {
-                var rms: Float = 0
-                vDSP_rmsqv(channels[channel], vDSP_Stride(buffer.stride), &rms, vDSP_Length(buffer.frameLength))
-                loudest = max(loudest, rms)
-            }
-            let level = Double(max(0, min(1, (20 * log10(max(loudest, 0.000_001)) + 55) / 55)))
-            Task { @MainActor [weak self] in
-                guard let self, self.generation == current, self.isListening else { return }
-                self.audioLevel = level
-            }
-        }
-        tapInstalled = true
+        let sink = SpeechAudioSampleSink(request: request)
+        let session = AVCaptureSession()
+        let output = AVCaptureAudioDataOutput()
+        let input = try AVCaptureDeviceInput(device: microphone)
+        captureSession = session
+        captureOutput = output
+        sampleSink = sink
+        observeCaptureRoute(session: session, microphone: microphone, generation: current)
         task = recognizer.recognitionTask(with: request) { [weak self] result, error in
             Task { @MainActor [weak self] in
                 guard let self, self.generation == current else { return }
@@ -139,15 +120,80 @@ final class SpeechInput: ObservableObject {
         }
 
         do {
-            engine.prepare()
-            try engine.start()
+            try await startCapture(session, input: input, output: output, sink: sink)
+            guard generation == current, !Task.isCancelled else {
+                stopAudio()
+                throw CancellationError()
+            }
+            isStarting = false
             isListening = true
             status = "Listening — \(recognitionMode)."
+            log.notice("Speech input bound to built-in microphone \(microphone.localizedName, privacy: .public), UID \(microphone.uniqueID, privacy: .public), transport \(microphone.transportType)")
         } catch {
             cancel()
             status = error.localizedDescription
             throw error
         }
+    }
+
+    private static func builtInMicrophone() throws -> AVCaptureDevice {
+        let discovery = AVCaptureDevice.DiscoverySession(deviceTypes: [.microphone], mediaType: .audio, position: .unspecified)
+        guard let device = discovery.devices.first(where: {
+            $0.isConnected && $0.transportType == Int32(kAudioDeviceTransportTypeBuiltIn)
+        }) else {
+            throw SpeechInputError(message: "The Mac’s built-in microphone is unavailable. Jev will not use a Bluetooth microphone.")
+        }
+        return device
+    }
+
+    private func startCapture(_ session: AVCaptureSession, input: AVCaptureDeviceInput,
+                              output: AVCaptureAudioDataOutput, sink: SpeechAudioSampleSink) async throws {
+        let captureQueue = self.captureQueue
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            captureQueue.async {
+                session.beginConfiguration()
+                guard session.canAddInput(input), session.canAddOutput(output) else {
+                    session.commitConfiguration()
+                    continuation.resume(throwing: SpeechInputError(message: "Jev could not start capture from the Mac’s built-in microphone."))
+                    return
+                }
+                session.addInput(input)
+                session.addOutput(output)
+                output.setSampleBufferDelegate(sink, queue: captureQueue)
+                session.commitConfiguration()
+                session.startRunning()
+                if session.isRunning {
+                    continuation.resume()
+                } else {
+                    continuation.resume(throwing: SpeechInputError(message: "Jev could not start the built-in microphone capture session."))
+                }
+            }
+        }
+    }
+
+    private func observeCaptureRoute(session: AVCaptureSession, microphone: AVCaptureDevice, generation: UUID) {
+        let center = NotificationCenter.default
+        routeObservers = [
+            center.addObserver(forName: AVCaptureSession.runtimeErrorNotification, object: session, queue: .main) { [weak self] note in
+                let detail = (note.userInfo?[AVCaptureSessionErrorKey] as? Error)?.localizedDescription
+                Task { @MainActor [weak self] in
+                    guard let self, self.generation == generation else { return }
+                    self.fail("Built-in microphone capture stopped. Jev will not switch to Bluetooth.\(detail.map { " " + $0 } ?? "")")
+                }
+            },
+            center.addObserver(forName: AVCaptureDevice.wasDisconnectedNotification, object: microphone, queue: .main) { [weak self] _ in
+                Task { @MainActor [weak self] in
+                    guard let self, self.generation == generation else { return }
+                    self.fail("The Mac’s built-in microphone disconnected. Jev stopped instead of switching devices.")
+                }
+            },
+            center.addObserver(forName: AVCaptureSession.wasInterruptedNotification, object: session, queue: .main) { [weak self] _ in
+                Task { @MainActor [weak self] in
+                    guard let self, self.generation == generation else { return }
+                    self.fail("Built-in microphone capture was interrupted. Jev stopped instead of switching devices.")
+                }
+            }
+        ]
     }
 
     func finish() {
@@ -161,10 +207,9 @@ final class SpeechInput: ObservableObject {
         if pendingFinal != nil {
             deliverFinal()
         } else {
-            stopAudio()
+            stopAudio { [weak self] in self?.task?.finish() }
             status = "Finishing — \(recognitionMode)."
-            // Finish buffered audio. Only Apple's final recognition may run a command.
-            task?.finish()
+            // Only Apple's final recognition may run a command.
         }
     }
 
@@ -180,21 +225,21 @@ final class SpeechInput: ObservableObject {
         status = "Cancelled."
     }
 
-    private func stopAudio() {
-        engine.stop()
-        if tapInstalled {
-            engine.inputNode.removeTap(onBus: 0)
-            tapInstalled = false
+    private func stopAudio(completion: (() -> Void)? = nil) {
+        let session = captureSession
+        let output = captureOutput
+        let sink = sampleSink
+        captureSession = nil
+        captureOutput = nil
+        sampleSink = nil
+        routeObservers.forEach { NotificationCenter.default.removeObserver($0) }
+        routeObservers.removeAll()
+        captureQueue.async {
+            session?.stopRunning()
+            output?.setSampleBufferDelegate(nil, queue: nil)
+            sink?.finish()
+            if let completion { DispatchQueue.main.async(execute: completion) }
         }
-        // Serialize endAudio with an audio callback that was already in progress.
-        let request = self.request
-        audioGate?.withLock { acceptingAudio in
-            if acceptingAudio {
-                acceptingAudio = false
-                request?.endAudio()
-            }
-        }
-        audioGate = nil
         isListening = false
         audioLevel = 0
     }
@@ -219,6 +264,30 @@ final class SpeechInput: ObservableObject {
         cancel()
         status = message
         onFailure?(message)
+    }
+}
+
+private final class SpeechAudioSampleSink: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate {
+    private let request: SFSpeechAudioBufferRecognitionRequest
+    private let acceptingAudio = OSAllocatedUnfairLock(initialState: true)
+
+    init(request: SFSpeechAudioBufferRecognitionRequest) {
+        self.request = request
+    }
+
+    func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
+        acceptingAudio.withLock { accepting in
+            if accepting { request.appendAudioSampleBuffer(sampleBuffer) }
+        }
+    }
+
+    func finish() {
+        acceptingAudio.withLock { accepting in
+            if accepting {
+                accepting = false
+                request.endAudio()
+            }
+        }
     }
 }
 

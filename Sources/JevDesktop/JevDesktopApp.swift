@@ -1,5 +1,6 @@
 import AppKit
 import Combine
+import DynamicNotchKit
 import JevCore
 import SwiftUI
 import os
@@ -17,7 +18,7 @@ struct JevDesktopApp: App {
             Button("Settings and commands…") { model.showSettings() }
             Button("Cancel current command") { model.cancel() }.disabled(!model.isBusy)
             Divider()
-            Text("Hold ⌃⌥Space to speak")
+            Text("Hold ⌃Space to speak")
             Button("Quit Desktop Voice") { NSApplication.shared.terminate(nil) }.keyboardShortcut("q")
         }
     }
@@ -39,7 +40,7 @@ final class AppModel: ObservableObject {
     static let shared = AppModel()
     private let log = Logger(subsystem: "local.jev-use", category: "status")
     @Published var headline = "Ready for a command" { didSet { log.notice("\(self.headline, privacy: .public) | \(self.detail, privacy: .public)") } }
-    @Published var detail = "Hold Control–Option–Space. Release to act. Escape cancels." { didSet { log.notice("  \(self.detail, privacy: .public)") } }
+    @Published var detail = "Hold Control–Space. Release to act. Escape cancels." { didSet { log.notice("  \(self.detail, privacy: .public)") } }
     /// The word the pixel field currently spells: the latest spoken word while the user speaks, otherwise nothing.
     @Published var word: String?
     @Published var transcript = ""
@@ -52,7 +53,6 @@ final class AppModel: ObservableObject {
     @Published var timing = ""
 
     let speech = SpeechInput()
-    let systemAudio = SystemAudioMonitor()
     private let hotKey = HotKey()
     private var key: String?
     /// Optional OpenRouter key: when present, the planner model turns the sentence into steps and Jev grounds each one.
@@ -78,7 +78,7 @@ final class AppModel: ObservableObject {
     private var appObserver: NSObjectProtocol?
     private var commandObserver: NSObjectProtocol?
     private var settingsWindow: NSWindow?
-    private var overlay: NSPanel?
+    private var voiceNotch: DynamicNotch<VoiceWidget, EmptyView, EmptyView>?
     private var shortcutReady = false
 
     var setupComplete: Bool { hasKey && accessibilityAllowed && speechAllowed }
@@ -132,7 +132,7 @@ final class AppModel: ObservableObject {
         }
         hotKey.onCancel = { [weak self] in
             if self?.isBusy == true { self?.cancel() }
-            else { self?.overlay?.orderOut(nil) }
+            else { self?.hideVoiceSurface() }
         }
         do { try hotKey.register(); shortcutReady = true }
         catch {
@@ -144,7 +144,6 @@ final class AppModel: ObservableObject {
             headline = "Waiting for Keychain…"
             detail = "Approve the saved-key prompt on your Mac if it appears."
         }
-        showOverlay()
         keyTask = Task {
             do {
                 let saved = try await Task.detached(priority: .userInitiated) { try KeyStore.read() }.value
@@ -157,7 +156,7 @@ final class AppModel: ObservableObject {
                 isLoadingKey = false
                 if shortcutReady {
                     headline = hasKey ? "Finish setup" : "Add your TypeSafe key"
-                    detail = "Complete setup, then hold ⌃⌥Space to speak."
+                    detail = "Complete setup, then hold ⌃Space to speak."
                 }
                 openMainInterface()
             } catch {
@@ -206,7 +205,7 @@ final class AppModel: ObservableObject {
             let granted = await speech.requestPermissions()
             speechAllowed = speech.hasPermissions
             headline = granted ? "Speech is ready" : "Speech needs access"
-            detail = granted ? "Switch to an app, then hold Control–Option–Space." : speech.status
+            detail = granted ? "Switch to an app, then hold Control–Space." : speech.status
         }
     }
 
@@ -371,7 +370,7 @@ final class AppModel: ObservableObject {
                     app = Desktop.currentTarget(fallback: lastExternalApp) ?? app
                 }
                 headline = lastResult
-                detail = steps.count > 1 ? "Done: \(steps.count) steps. Hold ⌃⌥Space to speak again." : "Hold ⌃⌥Space to speak again. Escape closes."
+                detail = steps.count > 1 ? "Done: \(steps.count) steps. Hold ⌃Space to speak again." : "Hold ⌃Space to speak again. Escape closes."
                 timing = String(format: "%.2fs total · %.2fs plan · %.2fs decision · %d action%@", Date().timeIntervalSince(started), planSeconds, modelSeconds, actions, actions == 1 ? "" : "s")
                 } else {
                     // Default: one Jev request per cycle, jev-ultrafast style. Code owns sequencing; Jev picks operation and target.
@@ -380,7 +379,7 @@ final class AppModel: ObservableObject {
                     if case .completed(let result, let count) = outcome {
                         actions = count
                         headline = result
-                        detail = count > 1 ? "Done in \(count) actions. Hold ⌃⌥Space to speak again." : "Hold ⌃⌥Space to speak again. Escape closes."
+                        detail = count > 1 ? "Done in \(count) actions. Hold ⌃Space to speak again." : "Hold ⌃Space to speak again. Escape closes."
                     }
                     timing = String(format: "%.2fs total · %.2fs decision · %d action%@", Date().timeIntervalSince(started), modelSeconds, actions, actions == 1 ? "" : "s")
                 }
@@ -1166,7 +1165,7 @@ final class AppModel: ObservableObject {
             window.center()
             settingsWindow = window
         }
-        overlay?.orderOut(nil)
+        hideVoiceSurface()
         NSApplication.shared.activate(ignoringOtherApps: true)
         settingsWindow?.makeKeyAndOrderFront(nil)
     }
@@ -1175,8 +1174,9 @@ final class AppModel: ObservableObject {
         refreshPermissions()
         settingsWindow?.orderOut(nil)
         if !isBusy {
-            headline = setupComplete ? "Ready when you are" : "Finish setup to use voice"
-            detail = setupComplete ? "Hold ⌃⌥Space to speak. Release to act." : "Open Settings from the Desktop Voice menu bar icon."
+            headline = !shortcutReady ? "Shortcut unavailable" : setupComplete ? "Ready when you are" : "Finish setup to use voice"
+            detail = !shortcutReady ? "Free Control–Space in System Settings → Keyboard → Keyboard Shortcuts, then restart Desktop Voice."
+                : setupComplete ? "Hold ⌃Space to speak. Release to act." : "Open Settings from the Desktop Voice menu bar icon."
             transcript = ""
             timing = ""
             wordTask?.cancel(); wordTask = nil
@@ -1187,37 +1187,36 @@ final class AppModel: ObservableObject {
 
     func dismissWidget() {
         if isBusy { cancel(showStatus: false) }
-        systemAudio.stop()
-        overlay?.orderOut(nil)
+        hideVoiceSurface()
     }
 
     private func showOverlay() {
-        if overlay == nil {
-            let panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 244, height: 172),
-                                styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
-            panel.level = .floating
-            panel.isOpaque = false
-            panel.backgroundColor = .clear
-            panel.hasShadow = true
-            panel.hidesOnDeactivate = false
-            panel.becomesKeyOnlyIfNeeded = true
-            panel.isMovableByWindowBackground = true
-            panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
-            panel.contentView = NSHostingView(rootView: VoiceWidget(model: self, speech: speech))
-            if !panel.setFrameUsingName("DesktopVoiceWidget", force: true), let screen = NSScreen.main {
-                panel.setFrameOrigin(NSPoint(x: screen.visibleFrame.midX - 122, y: screen.visibleFrame.minY + 36))
-            }
-            panel.setFrameAutosaveName("DesktopVoiceWidget")
-            overlay = panel
+        prepareVoiceSurface()
+        guard let voiceNotch, let screen = NSScreen.main ?? NSScreen.screens.first else { return }
+        Task {
+            await voiceNotch.expand(on: screen)
+            voiceNotch.windowController?.window?.isMovable = true
         }
-        systemAudio.start()
-        overlay?.orderFrontRegardless()
+    }
+
+    private func hideVoiceSurface() {
+        guard let voiceNotch else { return }
+        Task { await voiceNotch.hide() }
+    }
+
+    private func prepareVoiceSurface() {
+        guard voiceNotch == nil else { return }
+        voiceNotch = DynamicNotch(
+            hoverBehavior: .keepVisible,
+            style: .floating,
+            expanded: { VoiceWidget(model: self, speech: self.speech) }
+        )
     }
 
     func shutdown() {
         cancel(showStatus: false)
         keyTask?.cancel()
-        systemAudio.stop()
+        hideVoiceSurface()
         hotKey.unregister()
         if let appObserver { NSWorkspace.shared.notificationCenter.removeObserver(appObserver) }
         if let commandObserver { DistributedNotificationCenter.default().removeObserver(commandObserver) }
@@ -1274,7 +1273,7 @@ private struct SettingsView: View {
                     .font(.caption).foregroundStyle(.secondary)
             }
             VStack(alignment: .leading, spacing: 8) {
-                Text("3. Hold ⌃⌥Space and speak").font(.headline)
+                Text("3. Hold ⌃Space and speak").font(.headline)
                 Text("Release to act. Escape stops pending work.")
                 Text("Try “Open Desktop”, “Open Brave, go to google.com and type in hello”, or “Open Codex and type this: hello”.")
                     .font(.caption).foregroundStyle(.secondary)
@@ -1307,7 +1306,7 @@ private struct VoiceWidget: View {
     @ObservedObject var speech: SpeechInput
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var isHovering = false
-    @State private var field = PixelField(count: 720, bounds: CGSize(width: 216, height: 78))
+    @State private var field = PixelField(count: 200, bounds: CGSize(width: 144, height: 30))
 
     private var message: String {
         if speech.isListening { return model.transcript.isEmpty ? "Listening…" : model.transcript }
@@ -1315,47 +1314,42 @@ private struct VoiceWidget: View {
     }
 
     var body: some View {
-        VStack(spacing: 5) {
+        VStack(spacing: 3) {
+            Capsule()
+                .fill(.white.opacity(0.24))
+                .frame(width: 24, height: 3)
+                .frame(width: 40, height: 10)
+                .contentShape(Rectangle())
+                .overlay { WindowDragArea() }
             Group {
                 if reduceMotion {
-                    Text(model.word ?? "")
+                    Text(model.word ?? (speech.isListening ? "Listening…" : ""))
                         .font(.system(size: 34, weight: .heavy)).foregroundStyle(.white)
                         .minimumScaleFactor(0.3).lineLimit(1)
+                } else if !speech.isListening {
+                    Image(systemName: "waveform")
+                        .font(.system(size: 18, weight: .medium)).foregroundStyle(.white.opacity(0.4))
                 } else {
                     TimelineView(.animation(minimumInterval: 1.0 / 60)) { timeline in
                         Canvas { context, size in
-                            let music = model.systemAudio.levels
-                            if model.word == nil && !speech.isListening && music.isPlaying {
-                                field.equalise(music.bands, at: timeline.date.timeIntervalSinceReferenceDate)
-                            } else {
-                                field.spell(model.word)
-                            }
-                            field.step(to: timeline.date.timeIntervalSinceReferenceDate, level: speech.isListening ? speech.audioLevel : 0)
+                            field.spell(model.word)
+                            field.step(to: timeline.date.timeIntervalSinceReferenceDate, level: speech.audioLevel)
                             field.draw(in: &context)
                         }
                     }
                 }
             }
-            .frame(width: 216, height: 78)
+            .frame(width: 144, height: 30)
             .accessibilityHidden(true)
             Text(message)
-                .font(.system(size: 13, weight: .medium)).foregroundStyle(.white)
+                .font(.system(size: 12, weight: .medium)).foregroundStyle(.white)
                 .lineLimit(model.headline == "Command stopped" || model.headline.hasPrefix("Which one") ? 3 : 2)
                 .multilineTextAlignment(.center).help(message)
-            if !speech.isListening && !model.transcript.isEmpty {
-                Text(model.transcript).font(.system(size: 10)).foregroundStyle(.white.opacity(0.65))
-                    .lineLimit(2).multilineTextAlignment(.center).help(model.transcript)
-            }
-            Text("Hold ⌃⌥Space to speak")
-                .font(.system(size: 10, design: .monospaced)).foregroundStyle(.white.opacity(0.45))
+            Text("Hold ⌃Space to speak")
+                .font(.system(size: 9, design: .monospaced)).foregroundStyle(.white.opacity(0.4))
         }
-        .padding(.horizontal, 14)
-        .frame(width: 244, height: 172)
-        .background {
-            RoundedRectangle(cornerRadius: 22).fill(.ultraThinMaterial)
-                .overlay(RoundedRectangle(cornerRadius: 22).fill(Color.black.opacity(0.5)))
-                .overlay(RoundedRectangle(cornerRadius: 22).strokeBorder(.white.opacity(0.12), lineWidth: 1))
-        }
+        .padding(.horizontal, 10)
+        .frame(width: 180, height: 100)
         .overlay(alignment: .topTrailing) {
             HStack(spacing: 2) {
                 Button { model.showSettings() } label: {
@@ -1375,6 +1369,15 @@ private struct VoiceWidget: View {
     }
 }
 
+private struct WindowDragArea: NSViewRepresentable {
+    func makeNSView(context: Context) -> NSView { DragArea() }
+    func updateNSView(_ view: NSView, context: Context) {}
+
+    private final class DragArea: NSView {
+        override var mouseDownCanMoveWindow: Bool { true }
+    }
+}
+
 /// White pixels that drift while idle and assemble into the current word's letter shapes.
 @MainActor
 private final class PixelField {
@@ -1388,9 +1391,6 @@ private final class PixelField {
     private var pixels: [Pixel]
     private let bounds: CGSize
     private var word: String?
-    private var equalising = false
-    private var peaks: [Double] = []
-    private var peakTime: Double?
     private var lastTime: Double?
 
     init(count: Int, bounds: CGSize) {
@@ -1401,9 +1401,8 @@ private final class PixelField {
     }
 
     func spell(_ newWord: String?) {
-        guard newWord != word || equalising else { return }
+        guard newWord != word else { return }
         word = newWord
-        equalising = false
         var targets: [CGPoint] = []
         if let newWord, !newWord.isEmpty {
             var step = 3.0
@@ -1413,50 +1412,6 @@ private final class PixelField {
             } while targets.count > pixels.count && step < 8
         }
         assign(targets.map { Target(x: $0.x, y: $0.y, alpha: 1) })
-    }
-
-    /// Bars of bricks rising from a baseline, peak-hold marks above and a faded reflection below.
-    /// Every pixel owns a fixed brick slot, so bricks only fade in and out instead of flying between bars.
-    private static let barRows = 16, reflectionRows = 5
-    private var slotsPerBar: Int { Self.barRows + 1 + Self.reflectionRows }
-
-    func equalise(_ bands: [Float], at time: Double) {
-        equalising = true
-        word = nil
-        let pitch = bounds.width / Double(bands.count)
-        let baseline = bounds.height * 0.66
-        let brick = (baseline - 2) / Double(Self.barRows)
-        if peaks.count != bands.count { peaks = bands.map(Double.init) }
-        let dt = min(0.1, max(0, time - (peakTime ?? time)))
-        peakTime = time
-        var levels: [Int] = []
-        var peakRows: [Int] = []
-        for (index, band) in bands.enumerated() {
-            let level = Double(band)
-            // Peak marks hold, then fall slowly, like the detached segments in a 2000s player.
-            peaks[index] = level >= peaks[index] ? level : max(level, peaks[index] - dt * 0.4)
-            levels.append(Int(level * Double(Self.barRows) + 0.5))
-            peakRows.append(Int(peaks[index] * Double(Self.barRows) + 0.5))
-        }
-        for index in pixels.indices {
-            let bar = index % bands.count
-            let slot = index / bands.count
-            guard slot < slotsPerBar else { pixels[index].tx = nil; pixels[index].ty = nil; pixels[index].ta = 0; continue }
-            let x = pitch * (Double(bar) + 0.5)
-            pixels[index].tx = x
-            if slot < Self.barRows {
-                pixels[index].ty = baseline - brick * (Double(slot) + 0.5)
-                pixels[index].ta = slot < max(levels[bar], 1) ? 1 : 0
-            } else if slot == Self.barRows {
-                let row = peakRows[bar]
-                pixels[index].ty = baseline - brick * (Double(row) + 0.5)
-                pixels[index].ta = row > levels[bar] + 1 ? 0.9 : 0
-            } else {
-                let row = slot - Self.barRows - 1
-                pixels[index].ty = baseline + brick * (Double(row) + 0.5)
-                pixels[index].ta = row < levels[bar] ? 0.3 * (1 - Double(row) / Double(Self.reflectionRows)) : 0
-            }
-        }
     }
 
     private func assign(_ unsorted: [Target]) {
@@ -1503,16 +1458,7 @@ private final class PixelField {
         for pixel in pixels {
             let assembled = pixel.tx != nil
             let opacity = assembled ? pixel.ta : 0.3 + 0.25 * (0.5 + 0.5 * sin(pixel.seed * 50 + pixel.x * 0.05))
-            if equalising {
-                // Green bricks, brighter towards the top of each bar. Spare pixels stay hidden in this mode.
-                guard assembled, opacity > 0 else { continue }
-                let height = max(0, min(1, 1 - pixel.y / (bounds.height * 0.66)))
-                let brickWidth = bounds.width / Double(SystemAudioMonitor.bandCount) - 2
-                context.fill(Path(CGRect(x: pixel.x - brickWidth / 2, y: pixel.y - 1.1, width: brickWidth, height: 2.2)),
-                             with: .color(Color(hue: 0.36 - 0.06 * height, saturation: 0.85, brightness: 0.55 + 0.45 * height).opacity(opacity)))
-            } else {
-                context.fill(Path(CGRect(x: pixel.x - 1.3, y: pixel.y - 1.3, width: 2.6, height: 2.6)), with: .color(.white.opacity(opacity)))
-            }
+            context.fill(Path(CGRect(x: pixel.x - 1.3, y: pixel.y - 1.3, width: 2.6, height: 2.6)), with: .color(.white.opacity(opacity)))
         }
     }
 

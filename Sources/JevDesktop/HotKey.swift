@@ -35,13 +35,13 @@ final class HotKey {
             throw HotKeyError(code: installed, operation: "Install keyboard handler")
         }
         let registered = RegisterEventHotKey(
-            UInt32(kVK_Space), UInt32(controlKey | optionKey),
+            UInt32(kVK_Space), UInt32(controlKey),
             EventHotKeyID(signature: Self.signature, id: 1),
             GetApplicationEventTarget(), OptionBits(kEventHotKeyExclusive), &hotKey
         )
         guard registered == noErr else {
             unregister()
-            throw HotKeyError(code: registered, operation: "Register Control–Option–Space")
+            throw HotKeyError(code: registered, operation: "Register Control–Space")
         }
 
         localMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
@@ -102,7 +102,7 @@ private struct HotKeyError: LocalizedError {
 
     var errorDescription: String? {
         if code == OSStatus(eventHotKeyExistsErr) {
-            return "Control–Option–Space is already registered by another app. Free that shortcut, then restart Desktop Voice."
+            return "Control–Space is already registered. Change the conflicting shortcut in System Settings → Keyboard → Keyboard Shortcuts, then restart Desktop Voice."
         }
         return "\(operation) failed (macOS error \(code))."
     }

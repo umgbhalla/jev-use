@@ -15,7 +15,7 @@ open "$HOME/Applications/Desktop Voice.app"
 
 In setup: save your TypeSafe API key (stored in the Keychain), then allow Accessibility, microphone and speech.
 
-Hold **Control–Option–Space**, speak, release. **Escape** cancels. Or type a command in the widget, or from a shell: `scripts/say.sh "Open Finder"`.
+When setup is complete, Jev shows a small floating panel. Drag its handle to move it. Hold **Control–Space**, speak, release. Jev uses the Mac’s built-in microphone. **Escape** cancels. Or type a command in the widget, or from a shell: `scripts/say.sh "Open Finder"`.
 
 ## Examples
 
