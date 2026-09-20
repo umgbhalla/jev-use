@@ -44,7 +44,12 @@ final class AppModel: ObservableObject {
     /// The word the pixel field currently spells: the latest spoken word while the user speaks, otherwise nothing.
     @Published var word: String?
     @Published var transcript = ""
-    @Published var isBusy = false
+    @Published var isBusy = false {
+        didSet {
+            idleHideTask?.cancel()
+            if !isBusy { scheduleIdleHide() }
+        }
+    }
     @Published var hasKey = false
     @Published var isLoadingKey = true
     @Published var accessibilityAllowed = Desktop.hasAccess
@@ -79,6 +84,7 @@ final class AppModel: ObservableObject {
     private var commandObserver: NSObjectProtocol?
     private var settingsWindow: NSWindow?
     private var voiceNotch: DynamicNotch<VoiceWidget, EmptyView, EmptyView>?
+    private var idleHideTask: Task<Void, Never>?
     private var shortcutReady = false
 
     var setupComplete: Bool { hasKey && accessibilityAllowed && speechAllowed }
@@ -90,10 +96,14 @@ final class AppModel: ObservableObject {
             forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main
         ) { [weak self] notification in
             guard let app = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication,
-                  Desktop.isControllable(app) else { return }
+                  app.processIdentifier != ProcessInfo.processInfo.processIdentifier else { return }
             MainActor.assumeIsolated {
-                self?.lastExternalApp = app
-                self?.targetName = app.localizedName ?? "your current app"
+                guard let self else { return }
+                if Desktop.isControllable(app) {
+                    self.lastExternalApp = app
+                    self.targetName = app.localizedName ?? "your current app"
+                }
+                if !self.isBusy { self.hideVoiceSurface() }
             }
         }
         // Local command line entry: same path as the typed command box in Settings.
@@ -171,8 +181,12 @@ final class AppModel: ObservableObject {
 
     func openMainInterface() {
         refreshPermissions()
-        if setupComplete && shortcutReady { showVoiceWidget() }
-        else { showSettings() }
+        if setupComplete && shortcutReady {
+            settingsWindow?.orderOut(nil)
+            hideVoiceSurface()
+        } else {
+            showSettings()
+        }
     }
 
     func saveKey(_ value: String) {
@@ -1183,6 +1197,7 @@ final class AppModel: ObservableObject {
             word = nil
         }
         showOverlay()
+        if !isBusy { scheduleIdleHide() }
     }
 
     func dismissWidget() {
@@ -1202,6 +1217,16 @@ final class AppModel: ObservableObject {
     private func hideVoiceSurface() {
         guard let voiceNotch else { return }
         Task { await voiceNotch.hide() }
+    }
+
+    private func scheduleIdleHide() {
+        idleHideTask?.cancel()
+        guard voiceNotch != nil else { return }
+        idleHideTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(4))
+            guard !Task.isCancelled, let self, !self.isBusy else { return }
+            self.hideVoiceSurface()
+        }
     }
 
     private func prepareVoiceSurface() {
@@ -1315,12 +1340,14 @@ private struct VoiceWidget: View {
 
     var body: some View {
         VStack(spacing: 3) {
-            Capsule()
-                .fill(.white.opacity(0.24))
-                .frame(width: 24, height: 3)
-                .frame(width: 40, height: 10)
+            Image(systemName: "line.3.horizontal")
+                .font(.system(size: 11, weight: .medium))
+                .foregroundStyle(.white.opacity(0.48))
+                .frame(width: 48, height: 18)
                 .contentShape(Rectangle())
                 .overlay { WindowDragArea() }
+                .accessibilityLabel("Drag to move Jev")
+                .help("Drag to move Jev")
             Group {
                 if reduceMotion {
                     Text(model.word ?? (speech.isListening ? "Listening…" : ""))
